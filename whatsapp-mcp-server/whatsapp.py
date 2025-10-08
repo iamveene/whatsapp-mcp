@@ -20,6 +20,7 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    reactions: Optional[List[dict]] = None
 
 @dataclass
 class Chat:
@@ -94,19 +95,26 @@ def get_sender_name(sender_jid: str) -> str:
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
-    
+
     if show_chat_info and message.chat_name:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
-        
+
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-    
+
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
+        output += f"From: {sender_name}: {content_prefix}{message.content}"
+
+        # Add reactions if present
+        if hasattr(message, 'reactions') and message.reactions:
+            reactions_str = " ".join([r["reaction"] for r in message.reactions])
+            output += f" [{reactions_str}]"
+
+        output += "\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
     return output
@@ -186,8 +194,11 @@ def list_messages(
         
         cursor.execute(" ".join(query_parts), tuple(params))
         messages = cursor.fetchall()
-        
+
         result = []
+        message_ids = []
+        chat_jids = []
+
         for msg in messages:
             message = Message(
                 timestamp=datetime.fromisoformat(msg[0]),
@@ -197,19 +208,39 @@ def list_messages(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                reactions=None  # Will be populated below
             )
             result.append(message)
+            message_ids.append(msg[6])
+            chat_jids.append(msg[5])
+
+        # Fetch reactions for all messages in one query
+        if result:
+            reactions_map = get_reactions_for_messages(message_ids, chat_jids)
+            for message in result:
+                key = (message.id, message.chat_jid)
+                message.reactions = reactions_map.get(key, [])
             
         if include_context and result:
             # Add context for each message
             messages_with_context = []
+            seen_ids = set()
             for msg in result:
                 context = get_message_context(msg.id, context_before, context_after)
-                messages_with_context.extend(context.before)
-                messages_with_context.append(context.message)
-                messages_with_context.extend(context.after)
-            
+                # Deduplicate messages by ID
+                for ctx_msg in context.before:
+                    if ctx_msg.id not in seen_ids:
+                        messages_with_context.append(ctx_msg)
+                        seen_ids.add(ctx_msg.id)
+                if context.message.id not in seen_ids:
+                    messages_with_context.append(context.message)
+                    seen_ids.add(context.message.id)
+                for ctx_msg in context.after:
+                    if ctx_msg.id not in seen_ids:
+                        messages_with_context.append(ctx_msg)
+                        seen_ids.add(ctx_msg.id)
+
             return format_messages_list(messages_with_context, show_chat_info=True)
             
         # Format and display messages without context
@@ -301,7 +332,18 @@ def get_message_context(
                 id=msg[6],
                 media_type=msg[7]
             ))
-        
+
+        # Fetch reactions for all messages
+        all_messages = [target_message] + before_messages + after_messages
+        if all_messages:
+            message_ids = [m.id for m in all_messages]
+            chat_jids = [m.chat_jid for m in all_messages]
+            reactions_map = get_reactions_for_messages(message_ids, chat_jids)
+
+            for message in all_messages:
+                key = (message.id, message.chat_jid)
+                message.reactions = reactions_map.get(key, [])
+
         return MessageContext(
             message=target_message,
             before=before_messages,
@@ -622,6 +664,102 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
+def get_reactions_for_messages(message_ids: List[str], chat_jids: List[str]) -> dict:
+    """Get reactions for multiple messages efficiently.
+
+    Args:
+        message_ids: List of message IDs
+        chat_jids: List of corresponding chat JIDs
+
+    Returns:
+        Dictionary mapping (message_id, chat_jid) to list of reactions
+    """
+    if not message_ids:
+        return {}
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        # Build a query with placeholders for all message_id/chat_jid pairs
+        placeholders = ','.join([f'(?,?)' for _ in message_ids])
+        params = []
+        for mid, cjid in zip(message_ids, chat_jids):
+            params.extend([mid, cjid])
+
+        cursor.execute(f"""
+            SELECT
+                message_id,
+                chat_jid,
+                sender,
+                reaction,
+                timestamp
+            FROM reactions
+            WHERE (message_id, chat_jid) IN ({placeholders})
+            ORDER BY message_id, timestamp DESC
+        """, params)
+
+        reactions_map = {}
+        for row in cursor.fetchall():
+            key = (row[0], row[1])
+            if key not in reactions_map:
+                reactions_map[key] = []
+            reactions_map[key].append({
+                "sender": row[2],
+                "reaction": row[3],
+                "timestamp": row[4]
+            })
+
+        return reactions_map
+
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return {}
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+def get_message_reactions(message_id: str, chat_jid: str) -> List[dict]:
+    """Get all reactions for a specific message.
+
+    Args:
+        message_id: The ID of the message
+        chat_jid: The JID of the chat containing the message
+
+    Returns:
+        List of reaction dictionaries with sender, reaction, and timestamp
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT
+                sender,
+                reaction,
+                timestamp
+            FROM reactions
+            WHERE message_id = ? AND chat_jid = ?
+            ORDER BY timestamp DESC
+        """, (message_id, chat_jid))
+
+        reactions = []
+        for row in cursor.fetchall():
+            reactions.append({
+                "sender": row[0],
+                "reaction": row[1],
+                "timestamp": row[2]
+            })
+
+        return reactions
+
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     try:
         # Validate input
@@ -765,3 +903,29 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def backfill_reactions() -> Tuple[bool, str]:
+    """Trigger history sync to backfill reactions from WhatsApp.
+
+    This function triggers a history sync in the WhatsApp bridge, which will
+    fetch historical messages and their reactions from WhatsApp servers and
+    store them in the local database.
+
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    try:
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/sync-history")
+
+        if response.status_code == 200:
+            result = response.json()
+            return True, result.get("message", "History sync triggered successfully")
+        else:
+            return False, f"HTTP {response.status_code}: {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
