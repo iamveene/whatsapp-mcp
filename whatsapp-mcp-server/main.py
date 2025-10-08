@@ -9,6 +9,7 @@ from whatsapp import (
     get_contact_chats as whatsapp_get_contact_chats,
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
+    get_message_reactions as whatsapp_get_message_reactions,
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
@@ -145,7 +146,7 @@ def get_message_context(
     after: int = 5
 ) -> Dict[str, Any]:
     """Get context around a specific WhatsApp message.
-    
+
     Args:
         message_id: The ID of the message to get context for
         before: Number of messages to include before the target message (default 5)
@@ -153,6 +154,20 @@ def get_message_context(
     """
     context = whatsapp_get_message_context(message_id, before, after)
     return context
+
+@mcp.tool()
+def get_message_reactions(
+    message_id: str,
+    chat_jid: str
+) -> List[Dict[str, Any]]:
+    """Get all reactions for a specific WhatsApp message.
+
+    Args:
+        message_id: The ID of the message to get reactions for
+        chat_jid: The JID of the chat containing the message
+    """
+    reactions = whatsapp_get_message_reactions(message_id, chat_jid)
+    return reactions
 
 @mcp.tool()
 def send_message(

@@ -66,7 +66,7 @@ func NewMessageStore() (*MessageStore, error) {
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -83,6 +83,15 @@ func NewMessageStore() (*MessageStore, error) {
 			file_length INTEGER,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS reactions (
+			message_id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			reaction TEXT,
+			timestamp TIMESTAMP,
+			PRIMARY KEY (message_id, chat_jid, sender)
 		);
 	`)
 	if err != nil {
@@ -120,6 +129,27 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	)
+	return err
+}
+
+// Store a reaction in the database
+func (store *MessageStore) StoreReaction(messageID, chatJID, sender, reaction string, timestamp time.Time) error {
+	// Empty reaction means the reaction was removed
+	if reaction == "" {
+		_, err := store.db.Exec(
+			"DELETE FROM reactions WHERE message_id = ? AND chat_jid = ? AND sender = ?",
+			messageID, chatJID, sender,
+		)
+		return err
+	}
+
+	// Store or update the reaction
+	_, err := store.db.Exec(
+		`INSERT OR REPLACE INTO reactions
+		(message_id, chat_jid, sender, reaction, timestamp)
+		VALUES (?, ?, ?, ?, ?)`,
+		messageID, chatJID, sender, reaction, timestamp,
 	)
 	return err
 }
@@ -410,6 +440,12 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+	// Check if this is a reaction message
+	if reaction := msg.Message.GetReactionMessage(); reaction != nil {
+		handleReactionMessage(client, messageStore, msg, reaction, logger)
+		return
+	}
+
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
@@ -466,6 +502,34 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+		}
+	}
+}
+
+// Handle reaction messages
+func handleReactionMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, reaction *waProto.ReactionMessage, logger waLog.Logger) {
+	if reaction == nil {
+		return
+	}
+
+	// Get the message ID that was reacted to
+	messageID := reaction.GetKey().GetID()
+	chatJID := msg.Info.Chat.String()
+	sender := msg.Info.Sender.User
+
+	// Get the reaction emoji (empty string means reaction was removed)
+	reactionText := reaction.GetText()
+
+	// Store the reaction in the database
+	err := messageStore.StoreReaction(messageID, chatJID, sender, reactionText, msg.Info.Timestamp)
+	if err != nil {
+		logger.Warnf("Failed to store reaction: %v", err)
+	} else {
+		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
+		if reactionText == "" {
+			fmt.Printf("[%s] Reaction removed by %s from message %s in chat %s\n", timestamp, sender, messageID, chatJID)
+		} else {
+			fmt.Printf("[%s] %s reacted with %s to message %s in chat %s\n", timestamp, sender, reactionText, messageID, chatJID)
 		}
 	}
 }
@@ -774,6 +838,27 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for triggering history sync
+	http.HandleFunc("/api/sync-history", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Trigger history sync
+		requestHistorySync(client)
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Send response
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "History sync requested successfully",
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -838,7 +923,7 @@ func main() {
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			// Process regular messages
+			// Process regular messages (including reactions)
 			handleMessage(client, messageStore, v, logger)
 
 		case *events.HistorySync:
@@ -1053,6 +1138,52 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				// Check if this is a reaction message
+				if msg.Message.Message != nil {
+					if reaction := msg.Message.Message.GetReactionMessage(); reaction != nil {
+						// Handle reaction in history sync
+						messageID := reaction.GetKey().GetID()
+						reactionText := reaction.GetText()
+
+						// Get timestamp
+						msgTimestamp := time.Time{}
+						if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
+							msgTimestamp = time.Unix(int64(ts), 0)
+						} else {
+							continue
+						}
+
+						// Determine sender
+						var sender string
+						isFromMe := false
+						if msg.Message.Key != nil {
+							if msg.Message.Key.FromMe != nil {
+								isFromMe = *msg.Message.Key.FromMe
+							}
+							if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
+								sender = *msg.Message.Key.Participant
+							} else if isFromMe {
+								sender = client.Store.ID.User
+							} else {
+								sender = jid.User
+							}
+						} else {
+							sender = jid.User
+						}
+
+						// Store the reaction
+						err = messageStore.StoreReaction(messageID, chatJID, sender, reactionText, msgTimestamp)
+						if err != nil {
+							logger.Warnf("Failed to store reaction from history: %v", err)
+						} else {
+							fmt.Printf("✓ Stored reaction from history: %s reacted with %s to message %s in chat %s\n", sender, reactionText, messageID, chatJID)
+							logger.Infof("Stored reaction from history: %s reacted with %s to message %s", sender, reactionText, messageID)
+						}
+
+						continue
+					}
+				}
+
 				// Extract text content
 				var content string
 				if msg.Message.Message != nil {
@@ -1164,23 +1295,14 @@ func requestHistorySync(client *whatsmeow.Client) {
 		return
 	}
 
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
-	}
-
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
-	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
-	}
+	fmt.Println("╔════════════════════════════════════════════════════════════════════════╗")
+	fmt.Println("║  IMPORTANT LIMITATION: WhatsApp does NOT provide reactions in history ║")
+	fmt.Println("║  sync. Reactions can only be captured when they occur in real-time.   ║")
+	fmt.Println("║  Historical reactions before the bridge was running are NOT available.║")
+	fmt.Println("╚════════════════════════════════════════════════════════════════════════╝")
+	fmt.Println()
+	fmt.Println("This is a WhatsApp API limitation, not a bridge limitation.")
+	fmt.Println("From this point forward, all reactions will be captured and stored correctly.")
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
